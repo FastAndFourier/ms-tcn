@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import optim
 import copy
 import numpy as np
-
+import wandb
 
 class MultiStageModel(nn.Module):
     def __init__(self, num_stages, num_layers, num_f_maps, dim, num_classes):
@@ -29,12 +29,14 @@ class SingleStageModel(nn.Module):
         self.conv_1x1 = nn.Conv1d(dim, num_f_maps, 1)
         self.layers = nn.ModuleList([copy.deepcopy(DilatedResidualLayer(2 ** i, num_f_maps, num_f_maps)) for i in range(num_layers)])
         self.conv_out = nn.Conv1d(num_f_maps, num_classes, 1)
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x, mask):
         out = self.conv_1x1(x)
         for layer in self.layers:
             out = layer(out, mask)
         out = self.conv_out(out) * mask[:, 0:1, :]
+        out = self.dropout(out)
         return out
 
 
@@ -43,7 +45,7 @@ class DilatedResidualLayer(nn.Module):
         super(DilatedResidualLayer, self).__init__()
         self.conv_dilated = nn.Conv1d(in_channels, out_channels, 3, padding=dilation, dilation=dilation)
         self.conv_1x1 = nn.Conv1d(out_channels, out_channels, 1)
-        self.dropout = nn.Dropout()
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x, mask):
         out = F.relu(self.conv_dilated(x))
@@ -53,32 +55,50 @@ class DilatedResidualLayer(nn.Module):
 
 
 class Trainer:
-    def __init__(self, num_blocks, num_layers, num_f_maps, dim, num_classes):
+    def __init__(self, num_blocks, num_layers, num_f_maps, dim, num_classes, model_id):
         self.model = MultiStageModel(num_blocks, num_layers, num_f_maps, dim, num_classes)
         self.ce = nn.CrossEntropyLoss(ignore_index=-100)
         self.mse = nn.MSELoss(reduction='none')
         self.num_classes = num_classes
+        self.model_id = model_id
 
-    def train(self, save_dir, train_loader, num_epochs, learning_rate, device):
-        self.model.train()
+    def train(self, save_dir, train_loader, valid_loader, num_epochs, learning_rate, device, lambda_=0.15):
+        
         self.model.to(device)
         optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+
+        best_loss = np.inf
+
+        early_stop = 15
+
         for epoch in range(num_epochs):
+
+
+            self.model.train()
+
             epoch_loss = 0
             correct = 0
             total = 0
-            for batch in train_loader:
+
+            for b, batch in enumerate(train_loader):
                 
                 batch_input, batch_target = batch
                 mask = torch.ones_like(batch_target, dtype=torch.float)
-                batch_input, batch_target = batch_input.to(device), batch_target.to(device), mask.to(device)
+                batch_target = torch.argmax(batch_target,axis=1)
+                batch_input, batch_target, mask = batch_input.to(device), batch_target.to(device), mask.to(device)
                 optimizer.zero_grad()
                 predictions = self.model(batch_input, mask)
 
-                loss = 0
+                
+
+                loss_classif = 0
+                loss_boundary = 0
+
                 for p in predictions:
-                    loss += self.ce(p.transpose(2, 1).contiguous().view(-1, self.num_classes), batch_target.view(-1))
-                    loss += 0.15*torch.mean(torch.clamp(self.mse(F.log_softmax(p[:, :, 1:], dim=1), F.log_softmax(p.detach()[:, :, :-1], dim=1)), min=0, max=16)*mask[:, :, 1:])
+                    loss_classif += self.ce(p.transpose(2, 1).contiguous().view(-1, self.num_classes), batch_target.view(-1))
+                    loss_boundary += lambda_*torch.mean(torch.clamp(self.mse(F.log_softmax(p[:, :, 1:], dim=1), F.log_softmax(p.detach()[:, :, :-1], dim=1)), min=0, max=16)*mask[:, :, 1:])
+
+                loss = loss_classif + loss_boundary
 
                 epoch_loss += loss.item()
                 loss.backward()
@@ -88,10 +108,87 @@ class Trainer:
                 correct += ((predicted == batch_target).float()*mask[:, 0, :].squeeze(1)).sum().item()
                 total += torch.sum(mask[:, 0, :]).item()
 
-            torch.save(self.model.state_dict(), save_dir + "/epoch-" + str(epoch + 1) + ".model")
-            torch.save(optimizer.state_dict(), save_dir + "/epoch-" + str(epoch + 1) + ".opt")
-            print("[epoch %d]: epoch loss = %f,   acc = %f" % (epoch + 1, epoch_loss / len(batch_gen.list_of_examples),
-                                                               float(correct)/total))
+                print(f"[epoch {epoch +1} / {num_epochs}]({b+1} / {len(train_loader)}): loss = {epoch_loss/(b+1):.2f} ({loss_classif:.2f} / {loss_boundary:.2f}) | Acc = {float(correct)/total:.2f}", end="\r")
+            
+            self.model.eval()
+
+            loss_val = 0
+            correct_val = 0
+            total_val = 0
+
+            for batch in valid_loader:
+
+                batch_input, batch_target = batch
+                mask = torch.ones_like(batch_target, dtype=torch.float)
+                batch_target = torch.argmax(batch_target,axis=1)
+                batch_input, batch_target, mask = batch_input.to(device), batch_target.to(device), mask.to(device)
+
+                predictions = self.model(batch_input, mask)
+
+                loss_classif_val = 0
+                loss_boundary_val = 0
+
+                for p in predictions:
+                    loss_classif_val += self.ce(p.transpose(2, 1).contiguous().view(-1, self.num_classes), batch_target.view(-1))
+                    loss_boundary_val += lambda_*torch.mean(torch.clamp(self.mse(F.log_softmax(p[:, :, 1:], dim=1), F.log_softmax(p.detach()[:, :, :-1], dim=1)), min=0, max=16)*mask[:, :, 1:])
+            
+                loss = loss_classif_val + loss_boundary_val
+
+                loss_val += loss.item()
+
+                _, predicted = torch.max(predictions[-1].data, 1)
+                correct_val += ((predicted == batch_target).float()*mask[:, 0, :].squeeze(1)).sum().item()
+                total_val += torch.sum(mask[:, 0, :]).item()
+            
+
+            print(f"[epoch {epoch +1} / {num_epochs}]({b+1} / {len(train_loader)}): loss train = {epoch_loss/len(train_loader):.2f} | Acc train = {float(correct)/total:.2f} // ", end=" ")
+            print(f"loss validation = {loss_val/len(valid_loader):.2f} | Acc validation = {float(correct_val)/total_val:.2f}", end=" ")
+            
+
+
+
+            if loss_val < best_loss:
+                torch.save(self.model, save_dir+f"/best_model_{self.model_id}.pt")
+                best_loss = loss_val
+                early_stop = 15
+                print("[Best model on validation set]")
+            else:
+                early_stop -= 1
+                print()
+
+            if early_stop == 0:
+                print("Early stopping!")
+                break
+            
+            wandb.log({"val_loss": loss_val/len(valid_loader), "train_loss": epoch_loss/len(train_loader),
+                        "val_acc": float(correct_val)/total_val, "train_acc":float(correct)/total})
+
+        best_model = torch.load(save_dir+f"/best_model_{self.model_id}.pt")
+        self.model.eval()
+        correct_val = 0
+        total_val = 0
+
+        for batch in valid_loader:
+
+            batch_input, batch_target = batch
+            mask = torch.ones_like(batch_target, dtype=torch.float)
+            batch_target = torch.argmax(batch_target,axis=1)
+            batch_input, batch_target, mask = batch_input.to(device), batch_target.to(device), mask.to(device)
+
+            predictions = best_model(batch_input, mask)
+
+            _, predicted = torch.max(predictions[-1].data, 1)
+            correct_val += ((predicted == batch_target).float()*mask[:, 0, :].squeeze(1)).sum().item()
+            total_val += torch.sum(mask[:, 0, :]).item()
+
+        
+        wandb.log({'best_val_acc':float(correct_val)/total_val})
+
+            # torch.save(self.model, s)
+            # torch.save(self.model.state_dict(), save_dir + "/epoch-" + str(epoch + 1) + ".model")
+            
+            # print("[epoch %d]: epoch loss = %f,   acc = %f" % (epoch + 1, epoch_loss / len(batch_gen.list_of_examples),
+            #                                                    float(correct)/total))
 
     def predict(self, model_dir, results_dir, features_path, vid_list_file, epoch, actions_dict, device, sample_rate):
         self.model.eval()

@@ -3,7 +3,8 @@
 
 import numpy as np
 import argparse
-
+import torch
+import matplotlib.pyplot as plt
 
 def read_file(path):
     with open(path, 'r') as f:
@@ -36,7 +37,7 @@ def get_labels_start_end_time(frame_wise_labels, bg_class=["background"]):
 def levenstein(p, y, norm=False):
     m_row = len(p)    
     n_col = len(y)
-    D = np.zeros([m_row+1, n_col+1], np.float)
+    D = np.zeros([m_row+1, n_col+1], dtype=float)
     for i in range(m_row+1):
         D[i, 0] = i
     for i in range(n_col+1):
@@ -91,18 +92,45 @@ def f_score(recognized, ground_truth, overlap, bg_class=["background"]):
 
 
 def main():
+
+    data_path = "/media/isir/PHD/code/data_processing/Xml2Py/data/grasping"
+
     parser = argparse.ArgumentParser()
-
-    parser.add_argument('--dataset', default="gtea")
-    parser.add_argument('--split', default='1')
-
+    parser.add_argument('--id')
     args = parser.parse_args()
 
-    ground_truth_path = "./data/"+args.dataset+"/groundTruth/"
-    recog_path = "./results/"+args.dataset+"/split_"+args.split+"/"
-    file_list = "./data/"+args.dataset+"/splits/test.split"+args.split+".bundle"
 
-    list_of_videos = read_file(file_list).split('\n')[:-1]
+    classes = "tri"
+    sr = 100
+    duration = 30
+    modality = "both"
+
+
+    data_fname = f'{classes}_{sr}_{duration}_{0}_{modality}'
+
+    X = np.load(f"{data_path}/data_{data_fname}.npy")
+    y = np.load(f"{data_path}/label_{data_fname}.npy")
+    split = np.load(f"{data_path}/split_{data_fname}.npy", allow_pickle=True)[()]
+
+
+    X = X[split['test']]
+    y = y[split['test']]
+
+    
+    model = torch.load(f"models/ms_tcn/best_model_{args.id}.pt").cuda()
+    model.eval()
+    X_tensor = torch.from_numpy(X).float().cuda()
+    mask = torch.ones_like(X_tensor).cuda()
+    pred = torch.argmax(model(X_tensor, mask)[-1], axis=1).cpu().numpy()
+    y = np.argmax(y, axis=1)
+
+
+    for i in range(len(y)):
+        plt.plot(y[i], label="gt")
+        plt.plot(pred[i], label="pred")
+        plt.legend()
+        plt.show()    
+
 
     overlap = [.1, .25, .5]
     tp, fp, fn = np.zeros(3), np.zeros(3), np.zeros(3)
@@ -111,28 +139,24 @@ def main():
     total = 0
     edit = 0
 
-    for vid in list_of_videos:
-        gt_file = ground_truth_path + vid
-        gt_content = read_file(gt_file).split('\n')[0:-1]
-        
-        recog_file = recog_path + vid.split('.')[0]
-        recog_content = read_file(recog_file).split('\n')[1].split()
+    for w in range(len(y)):
 
-        for i in range(len(gt_content)):
+        for i in range(len(y[w])):
             total += 1
-            if gt_content[i] == recog_content[i]:
+            if y[w,i] == pred[w,i]:
                 correct += 1
         
-        edit += edit_score(recog_content, gt_content)
+        edit += edit_score(pred[w], y[w])
 
         for s in range(len(overlap)):
-            tp1, fp1, fn1 = f_score(recog_content, gt_content, overlap[s])
+            tp1, fp1, fn1 = f_score(pred[w], y[w], overlap[s])
             tp[s] += tp1
             fp[s] += fp1
             fn[s] += fn1
-            
+        
     print("Acc: %.4f" % (100*float(correct)/total))
-    print('Edit: %.4f' % ((1.0*edit)/len(list_of_videos)))
+    print('Edit: %.4f' % ((1.0*edit)/len(y)))
+
     for s in range(len(overlap)):
         precision = tp[s] / float(tp[s]+fp[s])
         recall = tp[s] / float(tp[s]+fn[s])
